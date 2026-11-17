@@ -15,12 +15,13 @@ import io
 import os
 import sqlite3
 import uuid
+from datetime import timezone
 from typing import List
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from . import catalog
+from . import catalog, coverage
 from .config import (
     FIXED_COLUMNS,
     INDICATOR_COLUMN_PREFIX,
@@ -124,6 +125,31 @@ def _temp_path() -> str:
     return str(SHARD_DIR / f".tmp-{token}.parquet")
 
 
+def _coverage_keys(
+    table: pa.Table, indicator_ids: List[int]
+) -> List[tuple[str, int, str]]:
+    """由分片内容算出受影响的 (站点, 指标身份, UTC 日期) 键。
+
+    新分片只有落在某站某指标某日，才需要让该键上的旧覆盖报告过期；
+    不含指标列的分片不影响任何覆盖结论。
+    """
+    if not indicator_ids or table.num_rows == 0:
+        return []
+    stations = table.column(STATION_COLUMN).to_pylist()
+    times = table.column(SAMPLED_AT_COLUMN).to_pylist()
+    keys: set[tuple[str, int, str]] = set()
+    for station, sampled_at in zip(stations, times):
+        if station is None or sampled_at is None:
+            continue
+        day = sampled_at.astimezone(timezone.utc).date().isoformat()
+        # 站点与核验侧一致：去首尾空白后作为报告键
+        normalized = str(station).strip()
+        for indicator_id in indicator_ids:
+            keys.add((normalized, int(indicator_id), day))
+    return sorted(keys)
+
+
+
 def ingest_upload(
     conn: sqlite3.Connection,
     file_bytes: bytes,
@@ -184,7 +210,9 @@ def ingest_upload(
 
     # 5) 规范化分片表（固定列 + 身份列），原子落盘
     canonical_table = pa.table(arrays)
+    coverage_keys = _coverage_keys(canonical_table, present_indicator_ids)
     tmp_path = _temp_path()
+    final_path = None
     try:
         pq.write_table(canonical_table, tmp_path, compression="zstd")
         # fsync 保证 rename 后内容可持久化
@@ -206,10 +234,15 @@ def ingest_upload(
                 "INSERT INTO shard_indicators (shard_id, indicator_id) VALUES (?, ?)",
                 (shard_id, indicator_id),
             )
+        # 新分片落库后，让同站同指标同日的旧覆盖报告过期并撤回供数（仍在同一事务内）
+        retired_report_ids = coverage.expire_for_new_shard(conn, coverage_keys, shard_id)
     except BaseException:
-        # 任何意外：清理临时文件，交由外层事务回滚
+        # 任何意外：清理临时文件，交由外层事务回滚。
+        # 若已 rename 到最终路径，也要删掉这个“孤儿”分片，避免留下半份数据。
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+        if final_path is not None and os.path.exists(final_path):
+            os.unlink(final_path)
         raise
 
     return {
@@ -218,4 +251,5 @@ def ingest_upload(
         "row_count": n_rows,
         "stored_columns": [f"{INDICATOR_COLUMN_PREFIX}{i}" for i in present_indicator_ids],
         "file_path": final_path,
+        "expired_report_ids": retired_report_ids,
     }

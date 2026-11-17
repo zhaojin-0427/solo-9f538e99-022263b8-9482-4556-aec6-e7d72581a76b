@@ -8,9 +8,9 @@ from __future__ import annotations
 import sqlite3
 from typing import List, Optional
 
+from . import coverage
 from .config import MAX_INDICATORS, RESERVED_NAMES
 from .models import ConflictError, NotFound
-
 
 # ---------------------------------------------------------------------------
 # 读取辅助
@@ -159,8 +159,11 @@ def rename_indicator(conn: sqlite3.Connection, old_name: str, new_name_raw: str)
     return indicator_id, new_name, new_version
 
 
-def delete_indicator(conn: sqlite3.Connection, raw_name: str) -> tuple[int, int]:
-    """删除指标：身份保留但置为 inactive，产生新字段版。历史分片数据不删除。"""
+def delete_indicator(conn: sqlite3.Connection, raw_name: str) -> tuple[int, int, List[int]]:
+    """删除指标：身份保留但置为 inactive，产生新字段版。历史分片数据不删除。
+
+    同时让该指标的全部未过期覆盖报告过期，撤回其供数；返回被撤回的报告号。
+    """
     name = _validate_name(raw_name)
     target = find_active_by_name(conn, name)
     if target is None:
@@ -173,4 +176,5 @@ def delete_indicator(conn: sqlite3.Connection, raw_name: str) -> tuple[int, int]
         f"删除指标 {name!r}（indicator_id={indicator_id}，历史分片保留）",
         deactivate={indicator_id},
     )
-    return indicator_id, new_version
+    retired_report_ids = coverage.expire_for_deleted_indicator(conn, indicator_id)
+    return indicator_id, new_version, retired_report_ids

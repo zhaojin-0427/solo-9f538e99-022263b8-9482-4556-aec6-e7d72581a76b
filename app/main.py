@@ -15,10 +15,11 @@ from typing import Optional
 from fastapi import Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from . import catalog, ingest, query
+from . import catalog, coverage, ingest, query
 from .config import FIXED_COLUMNS, MAX_INDICATORS
-from .db import connect, immediate_transaction, init_db
+from .db import connect, immediate_transaction, init_db, read_transaction
 from .models import (
+    CoverageReport,
     CreateIndicatorRequest,
     IndicatorChangeResponse,
     IndicatorOut,
@@ -27,6 +28,7 @@ from .models import (
     RowPage,
     SchemaOut,
     SnapshotMeta,
+    SupplyStatus,
     UploadResponse,
     VersionOut,
 )
@@ -137,7 +139,7 @@ def create_indicator(
     "/schema/indicators/rename",
     response_model=IndicatorChangeResponse,
     tags=["字段管理"],
-    summary="指标改名（身份不变，产生新字段版）",
+    summary="指标改名（身份不变，产生新字段版；覆盖报告沿用原身份）",
 )
 def rename_indicator(
     payload: RenameRequest,
@@ -158,7 +160,7 @@ def rename_indicator(
     "/schema/indicators/{name}",
     response_model=IndicatorChangeResponse,
     tags=["字段管理"],
-    summary="删除指标（历史分片保留；再上传含该指标的文件会被整次拒绝）",
+    summary="删除指标（历史分片保留；相关覆盖报告过期并撤回供数）",
 )
 def delete_indicator(
     name: str,
@@ -167,9 +169,13 @@ def delete_indicator(
     lock=Depends(get_lock),
 ):
     with lock, immediate_transaction(conn):
-        indicator_id, new_version = catalog.delete_indicator(conn, name)
+        indicator_id, new_version, expired_report_ids = catalog.delete_indicator(conn, name)
     return IndicatorChangeResponse(
-        indicator_id=indicator_id, name=name, active=False, new_version=new_version
+        indicator_id=indicator_id,
+        name=name,
+        active=False,
+        new_version=new_version,
+        expired_report_ids=expired_report_ids,
     )
 
 
@@ -238,6 +244,63 @@ def get_snapshot(snapshot_id: int, conn=Depends(get_conn)):
     )
 
 
+# ---------------------------------------------------------------------------
+# 日覆盖核验与供数
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/coverage/verifications",
+    response_model=CoverageReport,
+    status_code=201,
+    tags=["日覆盖核验"],
+    summary="核验某站某指标一天的例行采样是否齐全（生成不可变报告）",
+)
+def verify_coverage(
+    request: Request,
+    station: str = Query(..., min_length=1, description="站点"),
+    indicator_id: int = Query(..., description="存续指标的身份 ID（改名不变）"),
+    date: str = Query(..., description="UTC 日期 YYYY-MM-DD"),
+    interval_minutes: int = Query(..., description="采样间隔（分钟），必须整除 1440"),
+    conn=Depends(get_conn),
+    lock=Depends(get_lock),
+):
+    with lock, immediate_transaction(conn):
+        report = coverage.verify_daily_coverage(
+            conn, station, indicator_id, date, interval_minutes
+        )
+    return CoverageReport(**report)
+
+
+@app.get(
+    "/coverage/reports/{report_id}",
+    response_model=CoverageReport,
+    tags=["日覆盖核验"],
+    summary="按报告号读取原始结论（过期后仍保留原结论）",
+)
+def get_coverage_report(report_id: int, conn=Depends(get_conn)):
+    return CoverageReport(**coverage.get_report(conn, report_id))
+
+
+@app.get(
+    "/coverage/supply",
+    response_model=SupplyStatus,
+    tags=["日覆盖核验"],
+    summary="当前供数查询：只认最新且未过期且齐全的报告，否则说明不可供数原因",
+)
+def get_supply_status(
+    station: str = Query(..., min_length=1, description="站点"),
+    indicator_id: int = Query(..., description="指标身份 ID"),
+    date: str = Query(..., description="UTC 日期 YYYY-MM-DD"),
+    interval_minutes: int = Query(..., description="采样间隔（分钟），必须整除 1440"),
+    conn=Depends(get_conn),
+    lock=Depends(get_lock),
+):
+    # 指标存续状态与最新报告必须在同一已提交视图内裁决，避免与上传/删除交错
+    with lock, read_transaction(conn):
+        result = coverage.supply_status(conn, station, indicator_id, date, interval_minutes)
+    return SupplyStatus(**result)
+
+
 @app.get("/", include_in_schema=False)
 def root():
     return {
@@ -245,4 +308,9 @@ def root():
         "docs": "/docs",
         "max_indicators": MAX_INDICATORS,
         "fixed_columns": list(FIXED_COLUMNS),
+        "coverage_endpoints": [
+            "/coverage/verifications",
+            "/coverage/reports/{report_id}",
+            "/coverage/supply",
+        ],
     }

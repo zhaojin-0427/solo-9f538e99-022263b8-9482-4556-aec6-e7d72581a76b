@@ -83,11 +83,34 @@ CREATE TABLE IF NOT EXISTS snapshot_shards (
     PRIMARY KEY (snapshot_id, shard_id)
 );
 
+-- 日覆盖核验报告：每次核验产生一个不可变结论，按报告号永久保留。
+-- 过期只写入 expired_at / expired_reason，绝不改写 complete / 缺测明细。
+CREATE TABLE IF NOT EXISTS coverage_reports (
+    report_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    station          TEXT NOT NULL,
+    indicator_id     INTEGER NOT NULL REFERENCES indicators(indicator_id),
+    indicator_name   TEXT NOT NULL,
+    coverage_date    TEXT NOT NULL,              -- UTC 日期 YYYY-MM-DD
+    interval_minutes INTEGER NOT NULL CHECK (interval_minutes > 0),
+    expected_count   INTEGER NOT NULL CHECK (expected_count > 0),
+    arrived_count    INTEGER NOT NULL CHECK (arrived_count >= 0),
+    complete         INTEGER NOT NULL CHECK (complete IN (0, 1)),
+    missing_instants TEXT NOT NULL,              -- JSON 数组，缺测时刻
+    arrived_instants TEXT NOT NULL,              -- JSON 数组，{sampled_at, shard_ids}
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expired_at       TEXT,
+    expired_reason   TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_indicators_active ON indicators(active);
 CREATE INDEX IF NOT EXISTS idx_version_indicators_version
     ON version_indicators(version_id);
 CREATE INDEX IF NOT EXISTS idx_shard_indicators_indicator
     ON shard_indicators(indicator_id);
+CREATE INDEX IF NOT EXISTS idx_coverage_reports_key
+    ON coverage_reports(station, indicator_id, coverage_date, interval_minutes, report_id);
+CREATE INDEX IF NOT EXISTS idx_coverage_reports_indicator
+    ON coverage_reports(indicator_id, expired_at);
 """
 
 
@@ -113,6 +136,24 @@ def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connecti
     不会留下半份字段、数据或快照。
     """
     conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """以 ``BEGIN`` 开启只读事务，为本请求提供稳定的已提交视图。
+
+    SQLite/WAL 下事务的快照在第一次读时建立；供数裁决需要同时读取
+    “指标是否存续”和“最新报告是否过期/齐全”，放进同一事务才能保证两者
+    来自同一个完整已提交状态，不会与并发的上传/删除交错出新旧混合的结论。
+    """
+    conn.execute("BEGIN")
     try:
         yield conn
     except Exception:

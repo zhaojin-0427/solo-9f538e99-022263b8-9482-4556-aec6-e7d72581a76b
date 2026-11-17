@@ -56,6 +56,9 @@ DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST /ingest/parquet` | 表单上传：`schema_version`（必填）+ `file`（Parquet） |
 | `GET /rows` | 分页查询；首次不带 `snapshot_id` 即建快照，之后带快照号翻页 |
 | `GET /snapshots/{snapshot_id}` | 快照元数据（固化的字段名与分片） |
+| `POST /coverage/verifications` | 日覆盖核验，生成不可变报告 |
+| `GET /coverage/reports/{report_id}` | 按报告号读取原始结论（过期后仍保留） |
+| `GET /coverage/supply` | 当前供数裁决（只认最新且未过期且齐全的报告） |
 | `GET /docs` | Swagger UI |
 
 ### Parquet 上传规则
@@ -80,8 +83,70 @@ DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ### 并发与一致性
 
-所有字段变更、上传与快照创建都在同一把进程写锁 + SQLite `BEGIN IMMEDIATE` 事务内裁决：
-字段变更与上传交错时，每个请求看到的都是一个完整的已提交字段状态，不存在半份结果。
+所有字段变更、上传、快照创建与覆盖核验都在同一把进程写锁 + SQLite `BEGIN IMMEDIATE` 事务内裁决：
+字段变更与上传/核验交错时，每个请求看到的都是一个完整的已提交字段状态，不存在半份结果。
+供数查询在只读事务内同时裁决“指标是否存续”与“最新报告状态”，不会读到新旧混合的结论。
+
+## 3.1 日覆盖核验
+
+水质数据员需要向建模组确认：**某站某指标某一天的例行采样是否齐全**。
+
+### 应采时刻与到齐判定
+
+* 输入：站点、**存续指标的身份 ID**、UTC 日期（`YYYY-MM-DD`）、采样间隔（分钟）。
+* 采样间隔必须是正整数且**整除 1440**；应采时刻从当日 00:00 起每间隔一个（不含次日 00:00），
+  共 `1440 / interval` 个。
+* 某应采时刻“到齐”的充要条件：存在一行，其 `station` 等于目标站点、`sampled_at` 等于该应采时刻、
+  且**该指标身份列** `i{indicator_id}` 的值**非 NULL**。
+  * 只认该身份：同名新建的其他指标、其他身份的列都不算。
+  * 其他站点、非应采时刻（例如 00:07）的值都不算。
+  * 同一时刻多行（同分片或跨分片）只算**一次**；报告的 `arrived_instants[].shard_ids`
+    列出该时刻的来源分片号（去重升序）。
+* 报告同时给出全部应采时刻、缺测时刻、已到时刻与来源分片。
+
+### 报告不可变 / 过期 / 供数
+
+| 行为 | 语义 |
+| --- | --- |
+| `POST /coverage/verifications` | 生成一个**不可变**报告，返回 `report_id` 与当时结论（201） |
+| `GET /coverage/reports/{report_id}` | 按号读取原结论；**过期后 `complete`、缺测明细一字不改**，只多出 `expired/expired_at/expired_reason` |
+| `GET /coverage/supply` | 只认该键（站/指标/日/间隔）**最新且未过期且齐全**的报告 |
+
+供数不可用的原因码：
+
+| `reason_code` | 含义 |
+| --- | --- |
+| `no_report` | 尚无该键的核验报告 |
+| `report_expired` | 最新报告已过期（当日有新分片或指标已删除） |
+| `report_incomplete` | 最新报告不齐全（`missing_instants` 给出缺测时刻） |
+| `indicator_unavailable` | 指标不存在或已删除 |
+
+过期触发（**只追加过期标记，不改写原结论**）：
+
+* **同站、同指标、同日出现新分片**：上传回执 `expired_report_ids` 列出本次被撤回供数的报告号；
+  其他站点、其他日期、其他指标的到货不影响该报告。
+* **指标被删除**：其全部未过期报告立即过期，删除接口回执同样列出 `expired_report_ids`。
+* **改名**沿用原身份：报告继续按原 `indicator_id` 有效；**同名新建**是新身份，不能沿用旧报告。
+
+### 一致性与失败语义
+
+* 核验与上传、字段变更在同一把写锁 + 立即事务内串行裁决，失败整体回滚：
+  不会产生半份报告，也不会误撤供数（例如含未知列的坏上传被整次拒绝，旧报告仍可用）。
+* 交叉执行后每份报告都满足 `arrived_count + missing_count == expected_count`，且
+  `complete == (missing_count == 0)`；供数裁决始终与最终已提交状态一致。
+
+### 示例
+
+```bash
+# 1) 核验（站点 S1、指标身份 1、2026-01-01、每小时一次）
+curl -X POST 'http://localhost:8000/coverage/verifications?station=S1&indicator_id=1&date=2026-01-01&interval_minutes=60'
+
+# 2) 供数裁决
+curl 'http://localhost:8000/coverage/supply?station=S1&indicator_id=1&date=2026-01-01&interval_minutes=60'
+
+# 3) 读取历史报告（过期后原结论保留）
+curl 'http://localhost:8000/coverage/reports/1'
+```
 
 ## 4. 目录结构
 
@@ -93,6 +158,7 @@ app/
   catalog.py   # 指标身份与字段版（新增/改名/删除）
   ingest.py    # Parquet 校验、按字段版映射身份、原子落盘
   query.py     # 快照创建与分页合读
+  coverage.py  # 日覆盖核验、报告不可变结论、过期与供数裁决
   main.py      # FastAPI 路由与并发控制
 tests/         # pytest 自测 + 独立 HTTP 冒烟脚本
 Dockerfile

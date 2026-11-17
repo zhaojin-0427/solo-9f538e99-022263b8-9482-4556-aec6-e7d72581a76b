@@ -96,6 +96,82 @@ def main() -> int:
     assert rejected.status_code == 409, rejected.text
     print("deleted-indicator upload rejected:", rejected.json()["detail"])
 
+    # 日覆盖核验：为“硝酸盐”建一个完整的 24 点小时序列（S1，2026-01-05）
+    from datetime import datetime, timedelta
+    day = "2026-01-05"
+    base = datetime.fromisoformat(day + "T00:00:00+00:00")
+    stamps = [(base + timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ") for h in range(24)]
+    cur = c.get("/schema").json()
+    nitrate_id = next(i["indicator_id"] for i in cur["indicators"] if i["name"] == "硝酸盐")
+    r = c.post(
+        "/ingest/parquet",
+        data={"schema_version": str(cur["current_version"])},
+        files={"file": ("day.parquet", parquet_bytes({
+            "station": ["S1"] * 24,
+            "sampled_at": stamps,
+            "硝酸盐": [float(h) for h in range(24)],
+        }, {"sampled_at": pa.string()}), "application/vnd.apache.parquet")},
+    )
+    r.raise_for_status()
+
+    rep = c.post("/coverage/verifications", params={
+        "station": "S1", "indicator_id": nitrate_id,
+        "date": day, "interval_minutes": 60,
+    })
+    rep.raise_for_status()
+    report = rep.json()
+    assert report["complete"] is True and report["arrived_count"] == 24, report
+    print("coverage report:", report["report_id"], "complete:", report["complete"])
+
+    status = c.get("/coverage/supply", params={
+        "station": "S1", "indicator_id": nitrate_id,
+        "date": day, "interval_minutes": 60,
+    }).json()
+    assert status["available"] is True, status
+    print("supply available:", status["report_id"])
+
+    # 同日补一块新分片 -> 旧报告过期并撤回供数，上传回执列出报告号
+    r = c.post(
+        "/ingest/parquet",
+        data={"schema_version": str(cur["current_version"])},
+        files={"file": ("patch.parquet", parquet_bytes({
+            "station": ["S1"], "sampled_at": [f"{day}T00:30:00Z"], "硝酸盐": [99.0],
+        }, {"sampled_at": pa.string()}), "application/vnd.apache.parquet")},
+    )
+    r.raise_for_status()
+    assert report["report_id"] in r.json()["expired_report_ids"], r.json()
+    print("upload receipt expired reports:", r.json()["expired_report_ids"])
+
+    kept = c.get(f"/coverage/reports/{report['report_id']}").json()
+    assert kept["complete"] is True and kept["expired"] is True, kept
+    withdrawn = c.get("/coverage/supply", params={
+        "station": "S1", "indicator_id": nitrate_id,
+        "date": day, "interval_minutes": 60,
+    }).json()
+    assert withdrawn["available"] is False and withdrawn["reason_code"] == "report_expired", withdrawn
+    print("supply withdrawn:", withdrawn["reason_code"])
+
+    # 重新核验（此时应采时刻仍未齐全），再删除指标 ->
+    # 只把“本次之前未过期”的报告列入回执，已过期报告保留首次过期信息
+    fresh = c.post("/coverage/verifications", params={
+        "station": "S1", "indicator_id": nitrate_id,
+        "date": day, "interval_minutes": 60,
+    })
+    fresh.raise_for_status()
+    fresh_id = fresh.json()["report_id"]
+    assert fresh_id != report["report_id"]
+
+    deleted = c.delete("/schema/indicators/硝酸盐")
+    deleted.raise_for_status()
+    assert fresh_id in deleted.json()["expired_report_ids"], deleted.json()
+    assert report["report_id"] not in deleted.json()["expired_report_ids"], deleted.json()
+    gone = c.get("/coverage/supply", params={
+        "station": "S1", "indicator_id": nitrate_id,
+        "date": day, "interval_minutes": 60,
+    }).json()
+    assert gone["available"] is False and gone["reason_code"] == "indicator_unavailable", gone
+    print("supply after delete:", gone["reason_code"])
+
     print("\nSMOKE OK")
     return 0
 
